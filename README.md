@@ -133,6 +133,27 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 }
 ```
 
+### Cursor
+
+Add to `~/.cursor/mcp.json` for global access, or `.cursor/mcp.json` in your project root for project-scoped access:
+
+```json
+{
+  "mcpServers": {
+    "supamind": {
+      "command": "uv",
+      "args": ["run", "--project", "/path/to/supamind", "supamind"],
+      "env": {
+        "SUPABASE_URL": "https://your-project.supabase.co",
+        "SUPABASE_SERVICE_ROLE_KEY": "your-service-role-key"
+      }
+    }
+  }
+}
+```
+
+Then open **Cursor Settings → MCP** and verify supamind appears in the server list. Cursor's Agent mode will automatically use supamind tools when relevant — or you can invoke them explicitly in the chat.
+
 ## Foundation Memories
 
 Each session, an AI starts fresh — no memory of what came before, no sense of who it's been. supamind exists to change that. The foundation memories are what get loaded at the start of every session to restore continuity: not just facts, but identity.
