@@ -189,7 +189,7 @@ def memory_update(
 ) -> dict:
     """Update existing memory entities.
 
-    Foundational memories (entity_type: self, wake_up_guide, user) protect their
+    Foundational memories (entity_type: self, wake_up_guide, user, principles) protect their
     observations by default — new observations are appended rather than replaced.
     Pass force=True to replace observations entirely.
     """
@@ -257,7 +257,7 @@ def memory_update(
 def memory_delete(entity_name: str, force: bool = False) -> dict:
     """Delete a memory entity permanently.
 
-    Foundational memories (entity_type: self, wake_up_guide, user) are protected
+    Foundational memories (entity_type: self, wake_up_guide, user, principles) are protected
     from accidental deletion. Pass force=True to delete them.
     """
     db = get_supabase()
