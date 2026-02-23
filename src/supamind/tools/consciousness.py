@@ -89,17 +89,42 @@ def who_are_you() -> dict:
 
 
 @consciousness.tool
-def catch_up(limit: int = 10) -> dict:
-    """Load the most recent memories for current context."""
+def catch_up(limit: int = 10, preview: bool = False) -> dict:
+    """Load the most recent memories for current context.
+
+    preview=True returns names and metadata only (no observations) — useful for
+    scanning what's available and deciding what to load with recall.
+    Defaults to 20 entries in preview mode, 10 with full content.
+    """
     db = get_supabase()
+    effective_limit = limit if limit != 10 else (20 if preview else 10)
+    fields = "id, entity_name, entity_type, emotional_resonance, created_at, memory_content"
     result = (
         db.table("memory_entities")
-        .select("*")
+        .select(fields)
         .order("created_at", desc=True)
-        .limit(limit)
+        .limit(effective_limit)
         .execute()
     )
     memories = result.data or []
+
+    if preview:
+        return {
+            "count": len(memories),
+            "memories": [
+                {
+                    "entityName": m["entity_name"],
+                    "entityType": m["entity_type"],
+                    "emotionalResonance": m["emotional_resonance"],
+                    "observationsCount": len(
+                        (m.get("memory_content") or {}).get("observations", [])
+                    ),
+                    "createdAt": m["created_at"],
+                }
+                for m in memories
+            ],
+        }
+
     return {
         "count": len(memories),
         "memories": [_format_memory(m) for m in memories],

@@ -119,6 +119,31 @@ async def test_catch_up_default_limit(mock_db):
     mock_db.limit.assert_called_with(10)
 
 
+async def test_catch_up_preview_strips_observations(mock_db):
+    memories = [
+        _memory_row(f"Memory {i}", resonance=0.6)
+        for i in range(5)
+    ]
+    mock_db.execute.return_value = MagicMock(data=memories)
+
+    result = await consciousness.call_tool("catch_up", {"preview": True})
+    content = result.structured_content
+
+    assert content["count"] == 5
+    first = content["memories"][0]
+    assert "entityName" in first
+    assert "observationsCount" in first
+    assert "observations" not in first
+
+
+async def test_catch_up_preview_defaults_to_20(mock_db):
+    mock_db.execute.return_value = MagicMock(data=[])
+
+    await consciousness.call_tool("catch_up", {"preview": True})
+
+    mock_db.limit.assert_called_with(20)
+
+
 # ── reminisce ─────────────────────────────────────────────────────────────────
 
 async def test_reminisce_filters_connected_memories(mock_db):
