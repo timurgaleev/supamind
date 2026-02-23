@@ -3,8 +3,7 @@ updates:
   - package-ecosystem: pip
     directory: /
     schedule:
-      interval: weekly
-      day: monday
+      interval: daily
     groups:
       fastmcp:
         patterns:
@@ -20,5 +19,4 @@ updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
-      day: monday
+      interval: daily
