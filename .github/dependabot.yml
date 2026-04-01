@@ -19,7 +19,7 @@ updates:
           - pylint
 
   - package-ecosystem: github-actions
-    directory: /
+    directory: .github/workflows
     assignees:
       - thatleda
     schedule:
