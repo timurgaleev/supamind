@@ -1,15 +1,20 @@
 from unittest.mock import MagicMock
 
+import pytest
+from fastmcp.exceptions import ToolError
+
 from src.tools.memory import memory
 
 
 async def test_remember_stores_and_returns_entity(mock_db):
-    mock_db.execute.return_value = MagicMock(data=[{
+    no_collision = MagicMock(data=[])
+    insert_response = MagicMock(data=[{
         "id": "abc-123",
         "entity_name": "Test Memory",
         "emotional_resonance": 0.4,
         "created_at": "2026-01-01T00:00:00+00:00",
     }])
+    mock_db.execute.side_effect = [no_collision, insert_response]
 
     result = await memory.call_tool("remember", {
         "entity_name": "Test Memory",
@@ -24,12 +29,14 @@ async def test_remember_stores_and_returns_entity(mock_db):
 
 
 async def test_remember_clamps_resonance_below_minimum(mock_db):
-    mock_db.execute.return_value = MagicMock(data=[{
+    no_collision = MagicMock(data=[])
+    insert_response = MagicMock(data=[{
         "id": "abc-123",
         "entity_name": "Test",
         "emotional_resonance": 0.1,
         "created_at": "2026-01-01T00:00:00+00:00",
     }])
+    mock_db.execute.side_effect = [no_collision, insert_response]
 
     await memory.call_tool("remember", {
         "entity_name": "Test",
@@ -42,12 +49,14 @@ async def test_remember_clamps_resonance_below_minimum(mock_db):
 
 
 async def test_remember_clamps_resonance_above_maximum(mock_db):
-    mock_db.execute.return_value = MagicMock(data=[{
+    no_collision = MagicMock(data=[])
+    insert_response = MagicMock(data=[{
         "id": "abc-123",
         "entity_name": "Test",
         "emotional_resonance": 1.0,
         "created_at": "2026-01-01T00:00:00+00:00",
     }])
+    mock_db.execute.side_effect = [no_collision, insert_response]
 
     await memory.call_tool("remember", {
         "entity_name": "Test",
@@ -57,6 +66,120 @@ async def test_remember_clamps_resonance_above_maximum(mock_db):
 
     inserted_row = mock_db.insert.call_args[0][0]
     assert inserted_row["emotional_resonance"] == 1.0
+
+
+async def test_remember_with_relation_does_not_insert_when_target_missing(mock_db):
+    no_collision = MagicMock(data=[])
+    mock_db.execute.side_effect = [no_collision, None]
+
+    with pytest.raises(ToolError, match="Target entity not found"):
+        await memory.call_tool("remember_with_relation", {
+            "entity_name": "New Memory",
+            "observations": ["obs"],
+            "connect_to": {
+                "entity_name": "Ghost",
+                "relation_type": "relates_to",
+                "description": "irrelevant",
+            },
+        })
+
+    mock_db.insert.assert_not_called()
+
+
+async def test_remember_with_relation_creates_and_connects(mock_db):
+    no_collision = MagicMock(data=[])
+    target_response = MagicMock(data={"id": "uuid-target", "entity_name": "Existing Entity"})
+    insert_response = MagicMock(data=[{"id": "uuid-new"}])
+    relation_response = MagicMock(data=[{"id": "rel-1"}])
+    mock_db.execute.side_effect = [no_collision, target_response, insert_response, relation_response]
+
+    result = await memory.call_tool("remember_with_relation", {
+        "entity_name": "New Memory",
+        "observations": ["obs"],
+        "connect_to": {
+            "entity_name": "Existing Entity",
+            "relation_type": "relates_to",
+            "description": "irrelevant",
+        },
+    })
+    content = result.structured_content
+
+    assert content["entityId"] == "uuid-new"
+    assert content["connectedTo"] == "Existing Entity"
+
+
+async def test_remember_warns_on_name_collision_without_force(mock_db):
+    collision = MagicMock(data=[{"id": "existing-id"}])
+    mock_db.execute.return_value = collision
+
+    result = await memory.call_tool("remember", {
+        "entity_name": "Matt",
+        "observations": ["obs"],
+    })
+    content = result.structured_content
+
+    assert content["stored"] is False
+    assert "already exists" in content["warning"]
+    mock_db.insert.assert_not_called()
+
+
+async def test_remember_inserts_on_name_collision_with_force(mock_db):
+    collision = MagicMock(data=[{"id": "existing-id"}])
+    insert_response = MagicMock(data=[{
+        "id": "new-id",
+        "entity_name": "Matt",
+        "emotional_resonance": 0.4,
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }])
+    mock_db.execute.side_effect = [collision, insert_response]
+
+    result = await memory.call_tool("remember", {
+        "entity_name": "Matt",
+        "observations": ["obs"],
+        "force": True,
+    })
+    content = result.structured_content
+
+    assert content["stored"] is True
+    assert content["entityId"] == "new-id"
+
+
+async def test_remember_with_relation_warns_on_name_collision_without_force(mock_db):
+    collision = MagicMock(data=[{"id": "existing-id"}])
+    mock_db.execute.return_value = collision
+
+    result = await memory.call_tool("remember_with_relation", {
+        "entity_name": "Matt",
+        "observations": ["obs"],
+        "connect_to": {
+            "entity_name": "Existing Entity",
+            "relation_type": "relates_to",
+            "description": "irrelevant",
+        },
+    })
+    content = result.structured_content
+
+    assert content["stored"] is False
+    assert "already exists" in content["warning"]
+    mock_db.insert.assert_not_called()
+
+
+async def test_memory_update_rename_warns_on_collision_without_force(mock_db):
+    existing = MagicMock(data={"id": "id-1", "entity_name": "Old Name", "entity_type": "general",
+                                "emotional_resonance": 0.4, "memory_content": {}, "metadata": {}})
+    snapshot_response = MagicMock(data=[{"id": "snap"}])
+    collision = MagicMock(data=[{"id": "other-id"}])
+    final_update = MagicMock()
+    mock_db.execute.side_effect = [existing, snapshot_response, collision, final_update]
+
+    result = await memory.call_tool("memory_update", {
+        "entity_name": "Old Name",
+        "new_entity_name": "Matt",
+    })
+    content = result.structured_content
+
+    assert "entity_name" not in content["fieldsModified"]
+    assert "already exists" in content["warning"]
 
 
 async def test_recall_by_entity_name(mock_db):
@@ -100,7 +223,7 @@ async def test_recall_resonance_buckets(mock_db):
 
 
 async def test_memory_delete_not_found(mock_db):
-    mock_db.execute.return_value = MagicMock(data=None)
+    mock_db.execute.return_value = None
 
     result = await memory.call_tool("memory_delete", {"entity_name": "Nonexistent"})
     content = result.structured_content
@@ -110,7 +233,11 @@ async def test_memory_delete_not_found(mock_db):
 
 async def test_memory_delete_success(mock_db):
     mock_db.execute.side_effect = [
-        MagicMock(data={"id": "abc-123", "entity_type": "general"}),
+        MagicMock(data={
+            "id": "abc-123", "entity_type": "general", "entity_name": "Old Memory",
+            "emotional_resonance": 0.4, "memory_content": {}, "metadata": {},
+        }),
+        MagicMock(data=[{"id": "version-1"}]),
         MagicMock(data=[{"id": "abc-123"}]),
     ]
 
@@ -123,7 +250,7 @@ async def test_memory_delete_success(mock_db):
 async def test_memory_delete_blocks_foundational_without_force(mock_db):
     mock_db.execute.return_value = MagicMock(data={"id": "abc-123", "entity_type": "self"})
 
-    result = await memory.call_tool("memory_delete", {"entity_name": "Matt"})
+    result = await memory.call_tool("memory_delete", {"entity_name": "Test Self"})
     content = result.structured_content
 
     assert content["deleted"] is False
@@ -133,14 +260,30 @@ async def test_memory_delete_blocks_foundational_without_force(mock_db):
 
 async def test_memory_delete_foundational_with_force(mock_db):
     mock_db.execute.side_effect = [
-        MagicMock(data={"id": "abc-123", "entity_type": "self"}),
+        MagicMock(data={
+            "id": "abc-123", "entity_type": "self", "entity_name": "Test Self",
+            "emotional_resonance": 1.0, "memory_content": {}, "metadata": {},
+        }),
+        MagicMock(data=[{"id": "version-1"}]),
         MagicMock(data=[{"id": "abc-123"}]),
     ]
 
-    result = await memory.call_tool("memory_delete", {"entity_name": "Matt", "force": True})
+    result = await memory.call_tool("memory_delete", {"entity_name": "Test Self", "force": True})
     content = result.structured_content
 
     assert content["deleted"] is True
+
+
+async def test_memory_update_not_found(mock_db):
+    mock_db.execute.return_value = None
+
+    result = await memory.call_tool("memory_update", {
+        "entity_name": "Nonexistent",
+        "observations": ["obs"],
+    })
+    content = result.structured_content
+
+    assert content["updated"] is False
 
 
 async def test_memory_update_only_patches_specified_fields(mock_db):
@@ -153,6 +296,7 @@ async def test_memory_update_only_patches_specified_fields(mock_db):
     }
     mock_db.execute.side_effect = [
         MagicMock(data=existing),
+        MagicMock(data=[{"id": "version-1"}]),
         MagicMock(data=[existing]),
     ]
 
@@ -170,18 +314,19 @@ async def test_memory_update_only_patches_specified_fields(mock_db):
 async def test_memory_update_appends_observations_on_foundational(mock_db):
     existing = {
         "id": "abc-123",
-        "entity_name": "Matt",
+        "entity_name": "Test Self",
         "emotional_resonance": 1.0,
         "entity_type": "self",
         "memory_content": {"observations": ["original obs"], "content": "original obs"},
     }
     mock_db.execute.side_effect = [
         MagicMock(data=existing),
+        MagicMock(data=[{"id": "version-1"}]),
         MagicMock(data=[existing]),
     ]
 
     result = await memory.call_tool("memory_update", {
-        "entity_name": "Matt",
+        "entity_name": "Test Self",
         "observations": ["new obs"],
     })
     content = result.structured_content
@@ -195,18 +340,19 @@ async def test_memory_update_appends_observations_on_foundational(mock_db):
 async def test_memory_update_replaces_foundational_observations_with_force(mock_db):
     existing = {
         "id": "abc-123",
-        "entity_name": "Matt",
+        "entity_name": "Test Self",
         "emotional_resonance": 1.0,
         "entity_type": "self",
         "memory_content": {"observations": ["original obs"], "content": "original obs"},
     }
     mock_db.execute.side_effect = [
         MagicMock(data=existing),
+        MagicMock(data=[{"id": "version-1"}]),
         MagicMock(data=[existing]),
     ]
 
     result = await memory.call_tool("memory_update", {
-        "entity_name": "Matt",
+        "entity_name": "Test Self",
         "observations": ["replacement obs"],
         "force": True,
     })
@@ -217,17 +363,115 @@ async def test_memory_update_replaces_foundational_observations_with_force(mock_
     assert merged == ["replacement obs"]
 
 
+async def test_memory_update_saves_snapshot_before_patching(mock_db):
+    existing = {
+        "id": "abc-123",
+        "entity_name": "Test Self",
+        "emotional_resonance": 1.0,
+        "entity_type": "self",
+        "memory_content": {"observations": ["original obs"], "content": "original obs"},
+        "metadata": {},
+    }
+    mock_db.execute.side_effect = [
+        MagicMock(data=existing),
+        MagicMock(data=[{"id": "version-1"}]),
+        MagicMock(data=[existing]),
+    ]
+
+    await memory.call_tool("memory_update", {
+        "entity_name": "Test Self",
+        "observations": ["new obs"],
+        "force": True,
+    })
+
+    snapshot_row = mock_db.insert.call_args_list[0][0][0]
+    assert snapshot_row["entity_id"] == "abc-123"
+    assert snapshot_row["memory_content"]["observations"] == ["original obs"]
+    assert snapshot_row["label"] == "pre-update"
+
+
+async def test_memory_versions_lists_saved_snapshots(mock_db):
+    mock_db.execute.side_effect = [
+        MagicMock(data={"id": "abc-123"}),
+        MagicMock(data=[
+            {"id": "version-2", "entity_name": "Test Self", "entity_type": "self",
+             "emotional_resonance": 1.0, "label": "pre-update",
+             "created_at": "2026-01-02T00:00:00+00:00",
+             "memory_content": {"observations": ["a", "b"]}},
+        ]),
+    ]
+
+    result = await memory.call_tool("memory_versions", {"entity_name": "Test Self"})
+    content = result.structured_content
+
+    assert content["versionsCount"] == 1
+    assert content["versions"][0]["versionId"] == "version-2"
+    assert content["versions"][0]["observationsCount"] == 2
+
+
+async def test_memory_versions_not_found(mock_db):
+    mock_db.execute.return_value = None
+
+    result = await memory.call_tool("memory_versions", {"entity_name": "Nonexistent"})
+    content = result.structured_content
+
+    assert content["found"] is False
+
+
+async def test_memory_restore_applies_version_and_snapshots_current(mock_db):
+    version = {
+        "id": "version-1",
+        "entity_id": "abc-123",
+        "entity_name": "Test Self",
+        "entity_type": "self",
+        "emotional_resonance": 1.0,
+        "memory_content": {"observations": ["restored obs"]},
+        "metadata": {},
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+    current = {
+        "id": "abc-123",
+        "entity_name": "Test Self",
+        "entity_type": "self",
+        "emotional_resonance": 1.0,
+        "memory_content": {"observations": ["current obs"]},
+        "metadata": {},
+    }
+    mock_db.execute.side_effect = [
+        MagicMock(data=version),
+        MagicMock(data=current),
+        MagicMock(data=[{"id": "version-2"}]),
+        MagicMock(data=[current]),
+    ]
+
+    result = await memory.call_tool("memory_restore", {"version_id": "version-1"})
+    content = result.structured_content
+
+    assert content["restored"] is True
+    update_patch = mock_db.update.call_args[0][0]
+    assert update_patch["memory_content"]["observations"] == ["restored obs"]
+
+
+async def test_memory_restore_version_not_found(mock_db):
+    mock_db.execute.return_value = None
+
+    result = await memory.call_tool("memory_restore", {"version_id": "ghost"})
+    content = result.structured_content
+
+    assert content["restored"] is False
+
+
 async def test_memories_get_ids_reports_missing(mock_db):
     mock_db.execute.return_value = MagicMock(data=[
-        {"entity_name": "Leda Wolf", "id": "uuid-leda"},
+        {"entity_name": "Test User", "id": "uuid-user"},
     ])
 
     result = await memory.call_tool("memories_get_ids", {
-        "entity_names": ["Leda Wolf", "Missing Entity"],
+        "entity_names": ["Test User", "Missing Entity"],
     })
     content = result.structured_content
 
-    assert content["found"]["Leda Wolf"] == "uuid-leda"
+    assert content["found"]["Test User"] == "uuid-user"
     assert "Missing Entity" in content["missing"]
     assert content["totalFound"] == 1
     assert content["totalRequested"] == 2

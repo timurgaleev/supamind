@@ -24,6 +24,32 @@ def _is_uuid(value: str) -> bool:
         return False
 
 
+def _check_name_collision(db, entity_name: str, *, exclude_id: str | None = None) -> str | None:
+    """Return a warning message if entity_name is already taken, else None."""
+    query = db.table("memory_entities").select("id").eq("entity_name", entity_name)
+    if exclude_id:
+        query = query.neq("id", exclude_id)
+    if query.execute().data:
+        return (
+            f"Entity name {entity_name!r} already exists. "
+            "Use memory_update to append to it instead, or pass force=True to create "
+            "a duplicate anyway."
+        )
+    return None
+
+
+def _snapshot(db, existing: dict, label: str | None = None) -> None:
+    db.table("memory_entity_versions").insert({
+        "entity_id": existing["id"],
+        "entity_name": existing["entity_name"],
+        "entity_type": existing["entity_type"],
+        "emotional_resonance": existing["emotional_resonance"],
+        "memory_content": existing.get("memory_content", {}),
+        "metadata": existing.get("metadata", {}),
+        "label": label,
+    }).execute()
+
+
 @memory.tool
 def recall(
     entity_id: str | None = None,
@@ -86,9 +112,16 @@ def remember(
     observations: list[str],
     emotional_resonance: float = 0.4,
     entity_type: str = "general",
+    force: bool = False,
 ) -> dict:
-    """Store new memories with emotional resonance"""
+    """Store new memories with emotional resonance.
+
+    Warns instead of writing if entity_name already exists, unless force=True.
+    """
     db = get_supabase()
+    collision = _check_name_collision(db, entity_name)
+    if collision and not force:
+        return {"stored": False, "warning": collision}
     resonance = _clamp(emotional_resonance, MIN_RESONANCE, MAX_RESONANCE)
     row = {
         "entity_name": entity_name,
@@ -108,6 +141,7 @@ def remember(
     inserted = result.data[0] if result.data else {}
 
     return {
+        "stored": True,
         "entityId": inserted.get("id"),
         "entityName": inserted.get("entity_name"),
         "emotionalResonance": inserted.get("emotional_resonance"),
@@ -122,9 +156,28 @@ def remember_with_relation(
     observations: list[str],
     connect_to: ConnectionInfo,
     emotional_resonance: float = 0.4,
+    force: bool = False,
 ) -> dict:
-    """Store new memories and connect them to existing entities"""
+    """Store new memories and connect them to existing entities.
+
+    Warns instead of writing if entity_name already exists, unless force=True.
+    """
     db = get_supabase()
+    collision = _check_name_collision(db, entity_name)
+    if collision and not force:
+        return {"stored": False, "warning": collision}
+
+    target_response = (
+        db.table("memory_entities")
+        .select("id, entity_name")
+        .eq("entity_name", connect_to.entity_name)
+        .maybe_single()
+        .execute()
+    )
+    target = target_response.data if target_response else None
+    if not target:
+        raise ValueError(f"Target entity not found: {connect_to.entity_name!r}")
+
     resonance = _clamp(emotional_resonance, MIN_RESONANCE, MAX_RESONANCE)
     row = {
         "entity_name": entity_name,
@@ -146,17 +199,6 @@ def remember_with_relation(
 
     new_id = new_entity.data[0]["id"]
 
-    target = (
-        db.table("memory_entities")
-        .select("id, entity_name")
-        .eq("entity_name", connect_to.entity_name)
-        .single()
-        .execute()
-        .data
-    )
-    if not target:
-        raise ValueError(f"Target entity not found: {connect_to.entity_name!r}")
-
     relation = {
         "from_entity_id": target["id"],
         "to_entity_id": new_id,
@@ -171,11 +213,58 @@ def remember_with_relation(
     db.table("memory_relations").insert(relation).execute()
 
     return {
+        "stored": True,
         "entityId": new_id,
         "entityName": entity_name,
         "connectedTo": target["entity_name"],
         "relationType": connect_to.relation_type,
     }
+
+
+def _fetch_entity(db, entity_name: str) -> dict | None:
+    query = db.table("memory_entities").select("*")
+    if _is_uuid(entity_name):
+        query = query.eq("id", entity_name)
+    else:
+        query = query.eq("entity_name", entity_name)
+    response = query.maybe_single().execute()
+    return response.data if response else None
+
+
+def _apply_observations_patch(
+    patch: dict, modified: list[str], existing: dict, observations: list[str], force: bool
+) -> str | None:
+    """Merge (or replace, if force) observations into patch. Returns a warning, if any."""
+    existing_observations = (existing.get("memory_content") or {}).get("observations", [])
+    if force:
+        merged = observations
+        warning = None
+    else:
+        merged = existing_observations + observations
+        warning = (
+            f"{len(observations)} observation(s)"
+            f" appended to {len(existing_observations)} existing. "
+            f"Pass force=True to replace all observations entirely."
+        )
+    patch["memory_content"] = {
+        **existing.get("memory_content", {}),
+        "observations": merged,
+        "content": "\n".join(merged),
+    }
+    modified.append("observations")
+    return warning
+
+
+def _apply_rename_patch(
+    db, patch: dict, modified: list[str], existing: dict, new_entity_name: str, force: bool
+) -> str | None:
+    """Rename into patch if the name is free (or forced). Returns a warning, if any."""
+    collision = _check_name_collision(db, new_entity_name, exclude_id=existing["id"])
+    if collision and not force:
+        return collision + " Rename skipped; pass force=True to rename anyway."
+    patch["entity_name"] = new_entity_name
+    modified.append("entity_name")
+    return None
 
 
 @memory.tool
@@ -189,45 +278,24 @@ def memory_update(
 ) -> dict:
     """Update existing memory entities.
 
-    Foundational memories (entity_type: self, wake_up_guide, user, principles) protect their
-    observations by default — new observations are appended rather than replaced.
-    Pass force=True to replace observations entirely.
+    New observations are always appended to existing ones by default.
+    Pass force=True to replace all observations entirely.
     """
     db = get_supabase()
-    query = db.table("memory_entities").select("*")
-    if _is_uuid(entity_name):
-        query = query.eq("id", entity_name)
-    else:
-        query = query.eq("entity_name", entity_name)
-    existing = query.single().execute().data
-
+    existing = _fetch_entity(db, entity_name)
     if not existing:
         return {"updated": False, "message": f"Memory not found: {entity_name!r}"}
 
-    is_foundational = existing.get("entity_type") in FOUNDATIONAL_ENTITY_TYPES
-    warning = None
+    _snapshot(db, existing, label="pre-update")
 
     patch: dict = {"updated_at": datetime.now(UTC).isoformat()}
-    modified = []
+    modified: list[str] = []
+    warnings: list[str] = []
 
     if observations is not None:
-        existing_observations = (existing.get("memory_content") or {}).get("observations", [])
-        if is_foundational and not force:
-            merged = existing_observations + observations
-            warning = (
-                f"Foundational memory ({existing['entity_type']!r}): "
-                f"{len(observations)} observation(s) appended, not replaced. "
-                f"Pass force=True to replace all "
-                f"{len(existing_observations)} existing observations."
-            )
-        else:
-            merged = observations
-        patch["memory_content"] = {
-            **existing.get("memory_content", {}),
-            "observations": merged,
-            "content": "\n".join(merged),
-        }
-        modified.append("observations")
+        warning = _apply_observations_patch(patch, modified, existing, observations, force)
+        if warning:
+            warnings.append(warning)
 
     if emotional_resonance is not None:
         patch["emotional_resonance"] = _clamp(emotional_resonance, MIN_RESONANCE, MAX_RESONANCE)
@@ -238,8 +306,9 @@ def memory_update(
         modified.append("entity_type")
 
     if new_entity_name is not None:
-        patch["entity_name"] = new_entity_name
-        modified.append("entity_name")
+        warning = _apply_rename_patch(db, patch, modified, existing, new_entity_name, force)
+        if warning:
+            warnings.append(warning)
 
     db.table("memory_entities").update(patch).eq("id", existing["id"]).execute()
 
@@ -248,8 +317,8 @@ def memory_update(
         "updated": True,
         "fieldsModified": modified,
     }
-    if warning:
-        result["warning"] = warning
+    if warnings:
+        result["warning"] = " ".join(warnings)
     return result
 
 
@@ -261,10 +330,11 @@ def memory_delete(entity_name: str, force: bool = False) -> dict:
     from accidental deletion. Pass force=True to delete them.
     """
     db = get_supabase()
-    existing = (
-        db.table("memory_entities").select("id, entity_type")
-        .eq("entity_name", entity_name).single().execute().data
+    existing_response = (
+        db.table("memory_entities").select("*")
+        .eq("entity_name", entity_name).maybe_single().execute()
     )
+    existing = existing_response.data if existing_response else None
     if not existing:
         return {"deleted": False, "message": f"Memory not found: {entity_name!r}"}
 
@@ -277,17 +347,114 @@ def memory_delete(entity_name: str, force: bool = False) -> dict:
             ),
         }
 
+    _snapshot(db, existing, label="pre-delete")
     db.table("memory_entities").delete().eq("id", existing["id"]).execute()
     return {"deleted": True, "message": f"Deleted {entity_name!r}"}
 
 
 @memory.tool
+def memory_versions(entity_name: str, limit: int = 10) -> dict:
+    """List saved versions of an entity, newest first.
+
+    A version is auto-saved every time memory_update or memory_delete
+    touches an existing entity, so you can always get back to an earlier
+    state with memory_restore.
+    """
+    db = get_supabase()
+    entity_response = (
+        db.table("memory_entities").select("id")
+        .eq("entity_name", entity_name).maybe_single().execute()
+    )
+    entity = entity_response.data if entity_response else None
+    if not entity:
+        return {"found": False, "message": f"Memory not found: {entity_name!r}"}
+
+    rows = (
+        db.table("memory_entity_versions")
+        .select(
+            "id, entity_name, entity_type, emotional_resonance, "
+            "label, created_at, memory_content"
+        )
+        .eq("entity_id", entity["id"])
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+        .data or []
+    )
+    return {
+        "entityId": entity["id"],
+        "versionsCount": len(rows),
+        "versions": [
+            {
+                "versionId": r["id"],
+                "label": r["label"],
+                "createdAt": r["created_at"],
+                "emotionalResonance": r["emotional_resonance"],
+                "observationsCount": len((r.get("memory_content") or {}).get("observations", [])),
+            }
+            for r in rows
+        ],
+    }
+
+
+@memory.tool
+def memory_restore(version_id: str) -> dict:
+    """Restore an entity to a previously saved version.
+
+    The entity's current state is snapshotted first, so restoring is
+    itself reversible via memory_versions + memory_restore.
+    """
+    db = get_supabase()
+    version_response = (
+        db.table("memory_entity_versions").select("*")
+        .eq("id", version_id).maybe_single().execute()
+    )
+    version = version_response.data if version_response else None
+    if not version:
+        return {"restored": False, "message": f"Version not found: {version_id!r}"}
+
+    current_response = (
+        db.table("memory_entities").select("*")
+        .eq("id", version["entity_id"]).maybe_single().execute()
+    )
+    current = current_response.data if current_response else None
+    if not current:
+        return {
+            "restored": False,
+            "message": "The entity this version belonged to no longer exists.",
+        }
+
+    _snapshot(db, current, label="pre-restore")
+
+    db.table("memory_entities").update({
+        "entity_name": version["entity_name"],
+        "entity_type": version["entity_type"],
+        "emotional_resonance": version["emotional_resonance"],
+        "memory_content": version["memory_content"],
+        "metadata": version["metadata"],
+        "updated_at": datetime.now(UTC).isoformat(),
+    }).eq("id", current["id"]).execute()
+
+    return {
+        "restored": True,
+        "entityId": current["id"],
+        "entityName": version["entity_name"],
+        "restoredFrom": version["created_at"],
+    }
+
+
+@memory.tool
 def memory_search(
     query: str,
-    method: str = "semantic",
     limit: int = 10,
 ) -> dict:
-    """Search through memories using various methods"""
+    """Search through memories using full-text search.
+
+    Matches any word in the query (OR semantics), ranked by how many words
+    match. Use a few essential keywords rather than a long descriptive
+    sentence — extra words only add more ways to match, they don't narrow
+    the result set.
+    """
     db = get_supabase()
     result = db.rpc(
         "search_memory_content",
@@ -298,7 +465,7 @@ def memory_search(
     now = datetime.now(UTC)
 
     return {
-        "method": method,
+        "method": "full_text",
         "resultsCount": len(memories),
         "query": query,
         "memories": [

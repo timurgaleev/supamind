@@ -26,25 +26,14 @@ Go to [supabase.com](https://supabase.com), create a new project, choose a regio
 
 In the Supabase dashboard, go to **SQL Editor** and run the contents of `database/schema.sql`. This creates:
 
-- `memory_entities` — the main memory table with a `vector(384)` embedding column
+- `memory_entities` — the main memory table
 - `memory_relations` — typed relationships between memories
 - `consciousness_kernel` — a view for high-resonance memories
-- `search_memory_content` — full-text search via `to_tsvector`
-- `match_consciousness_memories` — vector similarity search via `pgvector`
+- `search_memory_content` — full-text search via `to_tsvector`, OR semantics across query tokens
 - `apply_emotional_decay` — entity-type based resonance decay
 - `apply_emotion_specific_decay` — emotion-aware decay (requires `emotion_schema.sql`)
-- `trigger_embedding_generation` — fires on every insert to generate a 384-dimensional embedding
-- HNSW vector index for fast approximate nearest-neighbour search
 
-### 3. Deploy the edge function
-
-The embedding trigger calls a Supabase Edge Function that generates embeddings locally — no OpenAI API key needed. It uses a multi-layer SHA-256 crypto hash across content, word frequency, bigrams, and text structure to produce a deterministic 384-dimensional vector.
-
-Deploy it from the `supabase/functions/generate-embedding/` directory, or copy the function from `database/schema.sql` comments.
-
-Then update the `trigger_embedding_generation` function body with your project URL and service role key.
-
-### 4. Get your credentials
+### 3. Get your credentials
 
 Go to **Project Settings → API** and copy:
 
@@ -257,8 +246,12 @@ Note: hooks run shell commands, not MCP tools directly. For full automatic initi
 | `recall` | Retrieve memories by entity name, ID, or type |
 | `memory_update` | Update an existing memory |
 | `memory_delete` | Permanently delete a memory |
-| `memory_search` | Full-text search across all memory content |
+| `memory_search` | Full-text search across all memory content, OR semantics across query tokens |
 | `memories_get_ids` | Resolve entity names to UUIDs |
+| `memory_versions` | List saved snapshots of an entity, newest first |
+| `memory_restore` | Restore an entity to a previously saved snapshot |
+
+`memory_update` and `memory_delete` auto-save a snapshot of an entity's prior state to `memory_entity_versions` before touching it — every edit is reversible via `memory_versions` + `memory_restore`, including the restore itself.
 
 ### Relations
 
@@ -311,35 +304,49 @@ When running as a local stdio server, supamind is inherently secured by the mach
 
 ### HTTP server (networked deployment)
 
-If you're running supamind as an HTTP/SSE server — shared with a team, hosted remotely, or exposed over a network — use GitHub OAuth to gate access.
+When `GITHUB_CLIENT_ID` is set, `server.py` switches from stdio to HTTP transport and gates every tool behind GitHub OAuth (`src/auth.py`), restricted to a single allowed GitHub login (`GITHUB_ALLOWED_LOGIN`) — a valid GitHub account isn't enough on its own, it must be *that* account. Without `GITHUB_CLIENT_ID` set, the server runs as unauthenticated local stdio, unchanged.
 
-#### 1. Create a GitHub OAuth App
+The service_role Supabase key stays a server-side secret either way — it's never sent to the client. It authenticates the server to Supabase; GitHub OAuth authenticates the human to the server. Two separate credentials, both ultimately rooted in the same GitHub identity.
 
-Go to **GitHub → Settings → Developer settings → OAuth Apps → New OAuth App**. Set the Authorization callback URL to:
+## Deploying to Render as a claude.ai custom connector
 
-```
-http://your-server/auth/callback
-```
+This lets you reach supamind from any claude.ai client — including the phone app — not just a local stdio session.
 
-#### 2. Set the environment variables
+### 1. Create a GitHub OAuth App
 
-```bash
-FASTMCP_SERVER_AUTH_GITHUB_CLIENT_ID=your-client-id
-FASTMCP_SERVER_AUTH_GITHUB_CLIENT_SECRET=your-client-secret
-```
+Go to **GitHub Settings → Developer settings → OAuth Apps → New OAuth App**.
 
-When these are present, `server.py` automatically activates `GitHubOAuthProvider`. When they're absent (local stdio), the server starts without auth — no configuration change needed between environments.
+- **Homepage URL**: your Render service URL (see step 2)
+- **Authorization callback URL**: `https://your-supamind-service.onrender.com/auth/callback`
 
-#### 3. Run with HTTP transport
+Save the **Client ID** and generate a **Client Secret**.
 
-```bash
-uvicorn supamind.server:mcp --host 0.0.0.0 --port 8000
-```
+### 2. Deploy to Render
 
-Users connecting to the server will be redirected through GitHub's OAuth flow before any tools are accessible.
+This repo includes `render.yaml`. In the Render dashboard, create a new **Blueprint** pointing at this repo, or create a **Web Service** manually with:
 
-## Vector search
+- Runtime: Python
+- Build command: `pip install uv && uv sync --frozen`
+- Start command: `uv run supamind`
 
-Every memory automatically gets a 384-dimensional embedding on insert, generated by a Deno edge function using multi-layer SHA-256 hashing — no external API required.
+Set these environment variables on the service:
 
-The `match_consciousness_memories(query_embedding, threshold, count)` function lets you find memories by semantic similarity. The default threshold of `0.78` filters out weak matches; lower it to cast a wider net.
+| Variable | Value |
+|---|---|
+| `SUPABASE_URL` | your Supabase project URL |
+| `SUPABASE_SERVICE_ROLE_KEY` | your Supabase service role key |
+| `GITHUB_CLIENT_ID` | from step 1 |
+| `GITHUB_CLIENT_SECRET` | from step 1 |
+| `GITHUB_ALLOWED_LOGIN` | your GitHub username — the only account allowed in |
+| `SUPAMIND_BASE_URL` | `https://your-supamind-service.onrender.com` (the URL Render assigns you) |
+
+Render sets `PORT` automatically; the server reads it.
+
+### 3. Add the connector in claude.ai
+
+Go to **Settings → Connectors → Add custom connector**:
+
+- **URL**: `https://your-supamind-service.onrender.com/mcp`
+- **Advanced settings → OAuth Client ID / Secret**: the same GitHub OAuth App credentials from step 1 (GitHub doesn't support Dynamic Client Registration, so these are entered manually rather than auto-discovered)
+
+Click **Connect** and authorize with the allowed GitHub account. Every claude.ai client signed into your account — desktop, web, phone — can now reach supamind.
